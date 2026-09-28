@@ -8,6 +8,10 @@ pub struct ItemInfo {
     pub kind: String,
     pub count: i32,
     pub custom_name: Option<String>,
+    /// The item carries a `minecraft:custom_name` component (not merely an `item_name`).
+    /// An anvil strips such a name for one extra level, because this client never
+    /// sends a rename.
+    pub has_custom_name: bool,
     pub lore: Vec<String>,
     pub enchantments: HashMap<String, u32>,
     pub stored_enchantments: HashMap<String, u32>,
@@ -163,6 +167,7 @@ pub fn inspect_item_with_bot(item: &ItemStack, bot: Option<&Client>) -> Option<I
 
     // 1. Direct typed extraction from DataComponentPatch
     if let Some(cn) = data.component_patch.get::<CustomName>() {
+        info.has_custom_name = true;
         let text = strip_color_and_normalize(&cn.name.to_string());
         if !text.is_empty() {
             info.custom_name = Some(text);

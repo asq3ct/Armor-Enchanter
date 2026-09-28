@@ -28,6 +28,13 @@
 - XP swaps require matching updates for both source and hotbar slots. Bottle-use requests are tracked separately from actual inventory and never overwrite GUI/enchanter caches. Each batch waits for server-confirmed consumption and XP gain. Partial, rejected, or missing acknowledgements reconnect for reconciliation after a five-second timeout.
 - Anvil close now updates Azalea's active menu as well as sending the server close packet, so XP inventory operations use the player menu.
 
+## Anvil stall escalation and combine costs
+
+- A stalled anvil step (missing contents, unacknowledged click, missing repair cost, or stalled recipe) closes the anvil and counts toward a limit of five per completed combine. Previously an unacknowledged click only logged a warning, so close, reopen, and re-click repeated forever.
+- At the limit the worker reconnects, one second after the close was sent. The anvil no longer disconnects before sending its close; vanilla drops anvil inputs on the ground when a player leaves with the menu open. The count resets on disconnect because the enchanter state survives automatic reconnects.
+- Expected combine costs use the armor's actual repair cost (prior work penalty), plus one level if it has a custom name; the anvil strips the name because the bot never sends a rename. The penalty used to be inferred from the enchantments present, so armor already worked in an anvil made clean books look cursed. Those books were discarded into the hopper one after another. The +1 allowance for a book's own penalty is unchanged.
+- XP is thrown for that expected cost before staging. Armor that would be Too Expensive even with a clean book is skipped with a warning and never costs a book. Remove such armor manually.
+
 ## Earlier buyer-order fixes (legacy delivery routine)
 
 
@@ -46,7 +53,7 @@
 
 ## Validation
 
-Run `cargo test --locked`. Regression tests cover four-type completion, duplicate snapshots, rejected confirmations, escrow, late/wrong-container contents, dropped contents after OpenScreen, source/inventory update ordering, consumed quota items, misleading XP stack counts, anvil completion while work is pending, rejected XP swaps, both swap packet orders, partial bottle consumption, delayed acknowledgements, and changed held items.
+Run `cargo test --locked`. Regression tests cover four-type completion, duplicate snapshots, rejected confirmations, escrow, late/wrong-container contents, dropped contents after OpenScreen, source/inventory update ordering, consumed quota items, misleading XP stack counts, anvil completion while work is pending, rejected XP swaps, both swap packet orders, partial bottle consumption, delayed acknowledgements, changed held items, anvil stall escalation and its reconnect budget, and combine costs for renamed or previously worked armor.
 
 These are local state-machine tests. No live account was connected, no items were sold or delivered during validation, and no server-load or throughput benchmark was performed.
 

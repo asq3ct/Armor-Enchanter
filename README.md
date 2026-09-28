@@ -34,6 +34,7 @@ An autonomous Minecraft enchanting bot built in Rust with [Azalea](https://githu
     - **Chestplate**: Protection IV (4 lvl) $\to$ Unbreaking III (4 lvl) $\to$ Mending (5 lvl)
     - **Leggings**: Blast Protection IV (8 lvl) $\to$ Unbreaking III (4 lvl) $\to$ Mending (5 lvl)
     - **Boots**: Blast Protection IV (8 lvl) $\to$ Unbreaking III (4 lvl) $\to$ Mending (5 lvl)
+  - These costs apply to armor enchanted from scratch. Expected costs come from each item's actual repair cost (prior work penalty), plus one level to remove a custom name. Armor that would be Too Expensive even with a clean book is skipped, and its book is kept.
 
 - **Anti-Cheat Resilient & Humanized Interactions**:
   - **Smooth View Interpolation**: Mimics human mouse rotation using a cosine ease-in-out curve ($\alpha = \frac{1 - \cos(\pi t)}{2}$) over 2–6 ticks, eliminating abrupt aim snapping while keeping rotations responsive.
