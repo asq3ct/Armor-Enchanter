@@ -471,6 +471,10 @@ async fn handle(bot: Client, event: Event, state: BotState) -> Result<(), anyhow
                 let mut ench = state.enchanter.lock().await;
                 ench.is_enchanting = false;
                 ench.anvil_container_id = None;
+                // This manager survives Azalea's auto-reconnect. Without a fresh stall
+                // budget, the next session would hit the limit on its first check and
+                // reconnect again without doing any work.
+                ench.failed_combine_attempts = 0;
             }
             {
                 let mut gui = state.gui.lock().await;
@@ -731,6 +735,20 @@ async fn wait_for_inventory_update(state: &BotState, timeout: std::time::Duratio
     let _ = tokio::time::timeout(timeout, state.inventory_updated.notified()).await;
 }
 
+/// Time for the server to process an anvil close before this client disconnects.
+const ANVIL_CLOSE_SETTLE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Escalate repeated anvil stalls to a reconnect, which gives a fresh server inventory.
+/// The stalled step has already sent the anvil close. Vanilla drops anvil inputs on the
+/// ground when a player disconnects with the menu open, so let the close land first.
+async fn reconnect_after_anvil_stalls(bot: &Client, state: &BotState, settle: std::time::Duration) {
+    state.enchanter.lock().await.is_enchanting = false;
+    error!("Anvil made no progress after repeated recoveries; reconnecting to reconcile inventory.");
+    tokio::time::sleep(settle).await;
+    state.is_enchanting.store(false, std::sync::atomic::Ordering::SeqCst);
+    bot.disconnect();
+}
+
 async fn trigger_enchanting_routine(bot: &Client, state: &BotState) {
     if state.is_enchanting.swap(true, std::sync::atomic::Ordering::SeqCst) {
         return;
@@ -886,6 +904,11 @@ async fn trigger_enchanting_routine(bot: &Client, state: &BotState) {
 
                 let mut ench = state_clone.enchanter.lock().await;
                 let finished = ench.process_anvil_combines(&bot_ench).await;
+                if ench.failure_limit_reached() {
+                    drop(ench);
+                    reconnect_after_anvil_stalls(&bot_ench, &state_clone, ANVIL_CLOSE_SETTLE).await;
+                    return;
+                }
                 if finished {
                     info!("Anvil combining phase finished successfully!");
                     break;
@@ -1650,6 +1673,46 @@ mod workflow_tests {
             std::time::Duration::from_millis(100),
             wait_for_inventory_update(&state, std::time::Duration::from_secs(5)),
         ).await.expect("server update should wake the worker immediately");
+    }
+
+    #[tokio::test]
+    async fn disconnect_gives_the_next_session_a_fresh_anvil_stall_budget() {
+        let mut app = azalea::app::App::new();
+        let entity = app.world_mut().spawn_empty().id();
+        let world = std::mem::take(app.world_mut());
+        let bot = Client::new(entity, Arc::new(world.into()));
+        let state = BotState { gui: Arc::new(Mutex::new(GuiManager::new())), ..Default::default() };
+        state.enchanter.lock().await.failed_combine_attempts = enchanter::MAX_FAILED_COMBINE_ATTEMPTS;
+        // Azalea reuses this entity, and so this BotState, when it reconnects.
+        handle(bot, Event::Disconnect(None), state.clone()).await.unwrap();
+        assert!(!state.enchanter.lock().await.failure_limit_reached(),
+            "a stale limit would make the next session reconnect on its first check");
+    }
+
+    #[tokio::test]
+    async fn anvil_stall_reconnect_waits_for_the_close_to_settle() {
+        use azalea::disconnect::DisconnectEvent;
+        use std::sync::atomic::Ordering::SeqCst;
+        let mut app = azalea::app::App::new();
+        app.add_message::<DisconnectEvent>();
+        let entity = app.world_mut().spawn_empty().id();
+        let world = std::mem::take(app.world_mut());
+        let bot = Client::new(entity, Arc::new(world.into()));
+        let disconnects = |bot: &Client| bot.ecs.read()
+            .resource::<azalea::ecs::message::Messages<DisconnectEvent>>().len();
+        let state = BotState { gui: Arc::new(Mutex::new(GuiManager::new())), ..Default::default() };
+        state.is_enchanting.store(true, SeqCst);
+        state.enchanter.lock().await.is_enchanting = true;
+
+        let escalation = reconnect_after_anvil_stalls(&bot, &state, std::time::Duration::from_millis(100));
+        tokio::pin!(escalation);
+        // While the anvil close settles, the connection must stay up.
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(10), &mut escalation).await.is_err());
+        assert_eq!(disconnects(&bot), 0);
+        escalation.await;
+        assert_eq!(disconnects(&bot), 1);
+        assert!(!state.is_enchanting.load(SeqCst));
+        assert!(!state.enchanter.lock().await.is_enchanting);
     }
 
     #[test]

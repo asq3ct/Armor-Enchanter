@@ -19,6 +19,13 @@ use std::sync::Arc;
 use tokio::sync::Notify;
 use tracing::{error, info, warn};
 
+/// Stalled anvil steps (missing contents, unacknowledged click, missing cost, stalled
+/// recipe) tolerated between successful combines before the worker reconnects.
+pub const MAX_FAILED_COMBINE_ATTEMPTS: u32 = 5;
+
+/// Survival anvils refuse combines costing this many levels or more ("Too Expensive!").
+pub const TOO_EXPENSIVE_LEVEL: u32 = 40;
+
 /// Experience points required to advance from Level L to Level L + 1 in Minecraft Java Edition.
 pub fn xp_to_next_level(level: u32) -> u32 {
     match level {
@@ -159,7 +166,18 @@ pub struct CombineTask {
     pub book_slot: i16,
     pub armor_desc: String,
     pub enchant_name: &'static str,
+    /// Levels the server should charge with a clean book (see `expected_clean_combine_cost`),
+    /// and the XP target before staging. Always below `TOO_EXPENSIVE_LEVEL`.
     pub required_level: u32,
+}
+
+/// The next book an armor piece needs, with that enchantment's cost when applied from a
+/// book (max(1, anvil_cost / 2) per level: Protection IV 4, Blast Protection IV 8,
+/// Unbreaking III 3, Mending 2).
+struct CombineStep {
+    enchant_name: &'static str,
+    enchant_cost: u32,
+    book_matches: fn(&ItemInfo) -> bool,
 }
 
 /// Tracks the progress and state of anvil enchanting operations.
@@ -796,10 +814,11 @@ pub fn find_placement_pos(bot: &Client) -> (BlockPos, BlockPos) {
     }
 
     /// Determine the next combination task based on user specifications and iamcal/enchant-order:
-    /// - Helmet: Protection IV (4 lvl) -> Unbreaking III (4 lvl) -> Mending (5 lvl)
-    /// - Chestplate: Protection IV (4 lvl) -> Unbreaking III (4 lvl) -> Mending (5 lvl)
-    /// - Leggings: Blast Protection IV (8 lvl) -> Unbreaking III (4 lvl) -> Mending (5 lvl)
-    /// - Boots: Blast Protection IV (8 lvl) -> Unbreaking III (4 lvl) -> Mending (5 lvl)
+    /// - Helmet / Chestplate: Protection IV -> Unbreaking III -> Mending
+    /// - Leggings / Boots: Blast Protection IV -> Unbreaking III -> Mending
+    ///
+    /// Armor enchanted from scratch costs 4 -> 4 -> 5 (or 8 -> 4 -> 5) levels. Armor already
+    /// worked in an anvil costs more; `required_level` uses its actual prior work penalty.
     pub fn find_next_combine_task(&self, bot: &Client) -> Option<CombineTask> {
         let mut armor_slots: Vec<(i16, ItemInfo)> = Vec::new();
         let mut book_slots: Vec<(i16, ItemInfo)> = Vec::new();
@@ -811,6 +830,18 @@ pub fn find_placement_pos(bot: &Client) -> (BlockPos, BlockPos) {
             if let Some(item) = item {
                 if let Some(info) = inspect_item_with_bot(item, Some(bot)) {
                     if is_diamond_armor(&info) {
+                        // Too Expensive even with a clean book: this piece can never be finished.
+                        // Skip it instead of throwing XP for it or rejecting books because of it.
+                        if let Some(step) = Self::next_combine_step(&info) {
+                            let cost = Self::clean_step_cost(&info, step.enchant_cost);
+                            if cost >= TOO_EXPENSIVE_LEVEL {
+                                warn!(
+                                    "Skipping {} in inventory slot #{}: its prior work penalty (repair cost {}) makes {} cost {cost} levels (Too Expensive). Remove it from the bot's inventory.",
+                                    info.kind, slot + 6, info.repair_cost.unwrap_or(0), step.enchant_name
+                                );
+                                continue;
+                            }
+                        }
                         armor_slots.push((slot, info));
                     } else if (info.kind.contains("Book") || info.kind.contains("EnchantedBook")) && !self.is_rejected_book(item) {
                         book_slots.push((slot, info));
@@ -819,60 +850,54 @@ pub fn find_placement_pos(bot: &Client) -> (BlockPos, BlockPos) {
             }
         }
 
-        if let Some((armor_slot, armor_info)) = crate::armor::next_armor(&armor_slots) {
-            let is_prot_piece = is_diamond_helmet(armor_info) || is_diamond_chestplate(armor_info);
-            let is_blast_piece = is_diamond_leggings(armor_info) || is_diamond_boots(armor_info);
+        let (armor_slot, armor_info) = crate::armor::next_armor(&armor_slots)?;
+        let step = Self::next_combine_step(armor_info)?;
+        let predicate = step.book_matches;
 
-            let mut target: Option<(&'static str, u32, fn(&ItemInfo) -> bool)> = None;
+        // Priority 1: Pick clean book (0 prior work penalty) that has not been marked cursed
+        let clean_book = book_slots.iter()
+            .filter(|(_, b)| predicate(b) && b.repair_cost.unwrap_or(0) == 0)
+            .filter(|(s, _)| *s >= 30)
+            .chain(book_slots.iter().filter(|(s, b)| predicate(b) && b.repair_cost.unwrap_or(0) == 0 && *s < 30))
+            .next();
 
-            if is_prot_piece {
-                if !armor_info.has_enchantment("protection", 4) {
-                    target = Some(("Protection IV", 4, is_protection_4));
-                } else if !armor_info.has_enchantment("unbreaking", 3) {
-                    target = Some(("Unbreaking III", 4, is_unbreaking_3));
-                } else if !armor_info.has_enchantment("mending", 1) {
-                    target = Some(("Mending", 5, is_mending));
-                }
-            } else if is_blast_piece {
-                if !armor_info.has_enchantment("blast_protection", 4) {
-                    target = Some(("Blast Protection IV", 8, is_blast_protection_4));
-                } else if !armor_info.has_enchantment("unbreaking", 3) {
-                    target = Some(("Unbreaking III", 4, is_unbreaking_3));
-                } else if !armor_info.has_enchantment("mending", 1) {
-                    target = Some(("Mending", 5, is_mending));
-                }
-            }
+        // Priority 2: Fall back to un-tested candidate book (will be verified in anvil)
+        let selected_book = clean_book.or_else(|| {
+            book_slots.iter()
+                .filter(|(_, b)| predicate(b))
+                .filter(|(s, _)| *s >= 30)
+                .chain(book_slots.iter().filter(|(s, b)| predicate(b) && *s < 30))
+                .next()
+        });
 
-            if let Some((ench_name, req_level, predicate)) = target {
-                // Priority 1: Pick clean book (0 prior work penalty) that has not been marked cursed
-                let clean_book = book_slots.iter()
-                    .filter(|(_, b)| predicate(b) && b.repair_cost.unwrap_or(0) == 0)
-                    .filter(|(s, _)| *s >= 30)
-                    .chain(book_slots.iter().filter(|(s, b)| predicate(b) && b.repair_cost.unwrap_or(0) == 0 && *s < 30))
-                    .next();
+        let (b_slot, _b_info) = selected_book?;
+        Some(CombineTask {
+            armor_slot: *armor_slot,
+            book_slot: *b_slot,
+            armor_desc: armor_info.kind.clone(),
+            enchant_name: step.enchant_name,
+            required_level: Self::clean_step_cost(armor_info, step.enchant_cost),
+        })
+    }
 
-                // Priority 2: Fall back to un-tested candidate book (will be verified in anvil)
-                let selected_book = clean_book.or_else(|| {
-                    book_slots.iter()
-                        .filter(|(_, b)| predicate(b))
-                        .filter(|(s, _)| *s >= 30)
-                        .chain(book_slots.iter().filter(|(s, b)| predicate(b) && *s < 30))
-                        .next()
-                });
-
-                if let Some((b_slot, _b_info)) = selected_book {
-                    return Some(CombineTask {
-                        armor_slot: *armor_slot,
-                        book_slot: *b_slot,
-                        armor_desc: armor_info.kind.clone(),
-                        enchant_name: ench_name,
-                        required_level: req_level,
-                    });
-                }
-            }
+    /// The next enchantment this piece needs, in iamcal/enchant-order sequence.
+    fn next_combine_step(armor: &ItemInfo) -> Option<CombineStep> {
+        let (base_enchantment, base_step) = if is_diamond_helmet(armor) || is_diamond_chestplate(armor) {
+            ("protection", CombineStep { enchant_name: "Protection IV", enchant_cost: 4, book_matches: is_protection_4 })
+        } else if is_diamond_leggings(armor) || is_diamond_boots(armor) {
+            ("blast_protection", CombineStep { enchant_name: "Blast Protection IV", enchant_cost: 8, book_matches: is_blast_protection_4 })
+        } else {
+            return None;
+        };
+        if !armor.has_enchantment(base_enchantment, 4) {
+            Some(base_step)
+        } else if !armor.has_enchantment("unbreaking", 3) {
+            Some(CombineStep { enchant_name: "Unbreaking III", enchant_cost: 3, book_matches: is_unbreaking_3 })
+        } else if !armor.has_enchantment("mending", 1) {
+            Some(CombineStep { enchant_name: "Mending", enchant_cost: 2, book_matches: is_mending })
+        } else {
+            None
         }
-
-        None
     }
 
     pub fn is_rejected_book(&self, item: &ItemStack) -> bool {
@@ -893,43 +918,15 @@ pub fn find_placement_pos(bot: &Client) -> (BlockPos, BlockPos) {
         self.find_next_combine_task(bot).is_some()
     }
 
-    /// Returns the expected anvil level cost for combining diamond armor with a clean book
-    /// according to the optimal sequencing from https://github.com/iamcal/enchant-order
+    /// Level cost the server should charge to combine `armor` with a clean (zero prior work
+    /// penalty) `book`, following https://github.com/iamcal/enchant-order sequencing.
+    ///
+    /// Vanilla charges both inputs' `repair_cost` (prior work penalty), plus the book's
+    /// enchantment cost, plus 1 level to strip a custom name, which the server removes
+    /// because this client never sends a rename. This uses the armor's actual penalty.
+    /// Inferring it from the enchantments present assumed the bot applied all of them, so
+    /// armor already worked elsewhere made every clean book look cursed.
     pub fn expected_clean_combine_cost(armor: &ItemInfo, book: &ItemInfo) -> u32 {
-        let is_prot_piece = is_diamond_helmet(armor) || is_diamond_chestplate(armor);
-        let is_blast_piece = is_diamond_leggings(armor) || is_diamond_boots(armor);
-
-        let has_main_prot = if is_prot_piece {
-            armor.has_enchantment("protection", 4)
-        } else if is_blast_piece {
-            armor.has_enchantment("blast_protection", 4)
-        } else {
-            false
-        };
-        let has_unb = armor.has_enchantment("unbreaking", 3);
-        let has_mend = armor.has_enchantment("mending", 1);
-
-        // Step 1: Base protection onto clean armor (0 PWP)
-        if is_protection_4(book) && !has_main_prot {
-            return 4;
-        }
-        if is_blast_protection_4(book) && !has_main_prot {
-            return 8;
-        }
-
-        // Step 2: Unbreaking III onto armor with base prot (1 PWP = 1 lvl)
-        if is_unbreaking_3(book) && has_main_prot && !has_unb {
-            return 4;
-        }
-
-        // Step 3: Mending onto armor with base prot + Unb III (2 PWP = 3 lvls)
-        if is_mending(book) && has_main_prot && has_unb && !has_mend {
-            return 5;
-        }
-
-        let prior_works = (has_main_prot as u32) + (has_unb as u32) + (has_mend as u32);
-        let armor_pwp = if prior_works == 0 { 0 } else { (1u32 << prior_works) - 1 };
-
         let enchant_cost = if is_protection_4(book) {
             4
         } else if is_blast_protection_4(book) {
@@ -941,8 +938,14 @@ pub fn find_placement_pos(bot: &Client) -> (BlockPos, BlockPos) {
         } else {
             1
         };
+        Self::clean_step_cost(armor, enchant_cost)
+    }
 
-        armor_pwp + enchant_cost
+    /// Armor prior work penalty + custom-name removal + the book's enchantment cost.
+    fn clean_step_cost(armor: &ItemInfo, enchant_cost: u32) -> u32 {
+        armor.repair_cost.unwrap_or(0)
+            .saturating_add(u32::from(armor.has_custom_name))
+            .saturating_add(enchant_cost)
     }
 
     /// Check if all 4 diamond armor pieces are present and fully enchanted according to user specifications.
@@ -1081,6 +1084,26 @@ pub fn find_placement_pos(bot: &Client) -> (BlockPos, BlockPos) {
                 .is_some_and(|item| !matches!(item, ItemStack::Empty)))
     }
 
+    /// True once repeated anvil stalls must be escalated to a reconnect by the worker.
+    pub fn failure_limit_reached(&self) -> bool {
+        self.failed_combine_attempts >= MAX_FAILED_COMBINE_ATTEMPTS
+    }
+
+    /// Count a stalled anvil step and close the anvil so the server returns its inputs.
+    /// Never disconnects here: vanilla drops anvil inputs on the ground when a player
+    /// leaves with the menu open, so the worker reconnects only after this close has
+    /// been processed (see `failure_limit_reached`).
+    fn record_anvil_stall(&mut self, bot: &Client, container_id: i32) {
+        self.failed_combine_attempts += 1;
+        if self.failure_limit_reached() {
+            error!(
+                "Anvil stalled {} times without a completed combine; closing it and escalating to a reconnect.",
+                self.failed_combine_attempts
+            );
+        }
+        self.close_anvil(bot, container_id);
+    }
+
     /// Automated enchanting loop: combines armor pieces with their required books in the open Anvil,
     /// dynamically throwing only the exact required XP bottles when level deficit is detected.
     pub async fn process_anvil_combines(&mut self, bot: &Client) -> bool {
@@ -1096,9 +1119,7 @@ pub fn find_placement_pos(bot: &Client) -> (BlockPos, BlockPos) {
         if let Some(since) = self.content_wait_since {
             if since.elapsed() >= std::time::Duration::from_secs(3) {
                 warn!("Anvil opened without contents; reopening for a fresh snapshot.");
-                self.failed_combine_attempts += 1;
-                if self.failed_combine_attempts >= 5 { bot.disconnect(); }
-                self.close_anvil(bot, container_id);
+                self.record_anvil_stall(bot, container_id);
             }
             return false;
         }
@@ -1117,11 +1138,7 @@ pub fn find_placement_pos(bot: &Client) -> (BlockPos, BlockPos) {
             } else {
                 if sent.elapsed() >= std::time::Duration::from_secs(3) {
                     warn!("Anvil click not acknowledged (slot #{slot}); closing to recover inputs.");
-                    self.failed_combine_attempts += 1;
-                    if self.failed_combine_attempts >= 5 {
-                        warn!("Multiple anvil clicks unacknowledged (5); closing anvil to recover.");
-                    }
-                    self.close_anvil(bot, container_id);
+                    self.record_anvil_stall(bot, container_id);
                 }
                 return false;
             }
@@ -1156,9 +1173,7 @@ pub fn find_placement_pos(bot: &Client) -> (BlockPos, BlockPos) {
                 let since = *self.recipe_wait_since.get_or_insert_with(std::time::Instant::now);
                 if since.elapsed() >= std::time::Duration::from_secs(3) {
                     warn!("Anvil inputs received but repair cost is missing; reopening for a fresh recipe.");
-                    self.failed_combine_attempts += 1;
-                    if self.failed_combine_attempts >= 5 { bot.disconnect(); }
-                    self.close_anvil(bot, container_id);
+                    self.record_anvil_stall(bot, container_id);
                 }
                 return false;
             }
@@ -1171,27 +1186,40 @@ pub fn find_placement_pos(bot: &Client) -> (BlockPos, BlockPos) {
                 let b_info = self.anvil_slots.get(&1).and_then(|i| inspect_item_with_bot(i, Some(bot)));
                 match (a_info, b_info) {
                     (Some(a), Some(b)) => Self::expected_clean_combine_cost(&a, &b),
-                    _ => 40,
+                    _ => TOO_EXPENSIVE_LEVEL,
                 }
             };
 
-            // CURSED BOOK CHECK: If combining the books costs more than expected + 1 level,
-            // or is >= 40 ("Too Expensive"), reject this cursed book!
-            // If the cost is 1 level greater than what is shown in the calculator (e.g. expected 8, game 9),
-            // it must NOT be considered cursed and will be used.
-            if server_cost > expected_cost + 1 || server_cost >= 40 {
+            // CURSED BOOK CHECK: expected_cost is the clean-book cost for this armor, so any
+            // excess comes from the book's own prior work penalty. One extra level is tolerated
+            // (e.g. expected 8, game 9) and the book is used; more, or "Too Expensive", rejects it.
+            let allowed_cost = expected_cost.saturating_add(1);
+            if server_cost > allowed_cost || server_cost >= TOO_EXPENSIVE_LEVEL {
                 let armor_info = self.anvil_slots.get(&0).and_then(|i| inspect_item_with_bot(i, Some(bot)));
                 let book_info = self.anvil_slots.get(&1).and_then(|i| inspect_item_with_bot(i, Some(bot)));
-                warn!(
-                    "[CURSED BOOK] REJECTING HIGH-COST COMBINE: Server repair cost ({} levels) exceeds expected {} levels (allowed threshold: {} levels)! Armor: kind={}, enchants={:?}. Book: kind={}, enchants={:?}. Ejecting inputs to hotbar for hopper discard.",
-                    server_cost,
-                    expected_cost,
-                    expected_cost + 1,
-                    armor_info.as_ref().map(|a| a.kind.as_str()).unwrap_or("Armor"),
-                    armor_info.as_ref().map(|a| &a.enchantments),
-                    book_info.as_ref().map(|b| b.kind.as_str()).unwrap_or("Book"),
-                    book_info.as_ref().map(|b| &b.stored_enchantments),
-                );
+                // Too Expensive even with a clean book: the armor's penalty is at fault, not the book.
+                let armor_at_fault = expected_cost >= TOO_EXPENSIVE_LEVEL;
+                if armor_at_fault {
+                    error!(
+                        "Anvil combine is Too Expensive ({server_cost} levels) because of the armor's own prior work penalty (repair cost {:?}); returning inputs and keeping the book. Armor: kind={}, enchants={:?}.",
+                        armor_info.as_ref().and_then(|a| a.repair_cost),
+                        armor_info.as_ref().map(|a| a.kind.as_str()).unwrap_or("Armor"),
+                        armor_info.as_ref().map(|a| &a.enchantments),
+                    );
+                } else {
+                    warn!(
+                        "[CURSED BOOK] REJECTING HIGH-COST COMBINE: Server repair cost ({} levels) exceeds expected {} levels (allowed threshold: {} levels)! Armor: kind={}, repair cost={:?}, enchants={:?}. Book: kind={}, repair cost={:?}, enchants={:?}. Ejecting inputs to hotbar for hopper discard.",
+                        server_cost,
+                        expected_cost,
+                        allowed_cost,
+                        armor_info.as_ref().map(|a| a.kind.as_str()).unwrap_or("Armor"),
+                        armor_info.as_ref().and_then(|a| a.repair_cost),
+                        armor_info.as_ref().map(|a| &a.enchantments),
+                        book_info.as_ref().map(|b| b.kind.as_str()).unwrap_or("Book"),
+                        book_info.as_ref().and_then(|b| b.repair_cost),
+                        book_info.as_ref().map(|b| &b.stored_enchantments),
+                    );
+                }
                 let is_actual_book = book_info.as_ref().map_or(false, |b| {
                     b.kind.to_lowercase().contains("book")
                         || is_protection_4(b)
@@ -1199,7 +1227,10 @@ pub fn find_placement_pos(bot: &Client) -> (BlockPos, BlockPos) {
                         || is_unbreaking_3(b)
                         || is_mending(b)
                 });
-                if !is_actual_book {
+                if armor_at_fault {
+                    self.pending_rejection_book = None;
+                    self.pending_rejection_slot = None;
+                } else if !is_actual_book {
                     error!(
                         "[CURSED BOOK GUARD] Slot #1 is not an enchanted book (found: {})! Refusing to queue for hopper discard.",
                         book_info.as_ref().map(|b| b.kind.as_str()).unwrap_or("None")
@@ -1256,9 +1287,7 @@ pub fn find_placement_pos(bot: &Client) -> (BlockPos, BlockPos) {
         if let Some(since) = self.recipe_wait_since {
             if since.elapsed() >= std::time::Duration::from_secs(3) {
                 warn!("Anvil recipe stalled; reopening to recover input items.");
-                self.failed_combine_attempts += 1;
-                if self.failed_combine_attempts >= 5 { bot.disconnect(); }
-                self.close_anvil(bot, container_id);
+                self.record_anvil_stall(bot, container_id);
             }
             return false;
         }
@@ -1830,11 +1859,14 @@ mod tests {
             ..Default::default()
         };
 
+        // Each anvil use sets the result's repair cost to 2 * max(inputs) + 1: 0 -> 1 -> 3.
         let mut prot4_chest = clean_chest.clone();
         prot4_chest.enchantments.insert("protection".to_string(), 4);
+        prot4_chest.repair_cost = Some(1);
 
         let mut prot4_unb3_chest = prot4_chest.clone();
         prot4_unb3_chest.enchantments.insert("unbreaking".to_string(), 3);
+        prot4_unb3_chest.repair_cost = Some(3);
 
         let clean_legs = ItemInfo {
             kind: "DiamondLeggings".to_string(),
@@ -1844,9 +1876,11 @@ mod tests {
 
         let mut blast4_legs = clean_legs.clone();
         blast4_legs.enchantments.insert("blast_protection".to_string(), 4);
+        blast4_legs.repair_cost = Some(1);
 
         let mut blast4_unb3_legs = blast4_legs.clone();
         blast4_unb3_legs.enchantments.insert("unbreaking".to_string(), 3);
+        blast4_unb3_legs.repair_cost = Some(3);
 
         let prot4_book = ItemInfo {
             kind: "EnchantedBook".to_string(),
@@ -1951,5 +1985,159 @@ mod tests {
         assert!(!is_cursed(9), "1 level above expected cost (e.g. 8 -> 9) must not be cursed");
         assert!(is_cursed(10), "2+ levels above expected cost (e.g. 8 -> 10) must be cursed");
         assert!(is_cursed(40), "Cost >= 40 ('Too Expensive') must always be rejected");
+    }
+
+    /// A client with no connection that records `DisconnectEvent`s, so tests can prove the
+    /// anvil manager never disconnects on its own.
+    fn offline_bot() -> Client {
+        let mut app = azalea::app::App::new();
+        app.add_message::<azalea::disconnect::DisconnectEvent>();
+        let entity = app.world_mut().spawn_empty().id();
+        let world = std::mem::take(app.world_mut());
+        Client::new(entity, Arc::new(world.into()))
+    }
+
+    fn disconnect_requests(bot: &Client) -> usize {
+        bot.ecs.read()
+            .resource::<azalea::ecs::message::Messages<azalea::disconnect::DisconnectEvent>>()
+            .len()
+    }
+
+    fn stalled_since() -> std::time::Instant {
+        std::time::Instant::now().checked_sub(std::time::Duration::from_secs(4)).expect("monotonic clock")
+    }
+
+    #[tokio::test]
+    async fn unacknowledged_anvil_clicks_escalate_only_after_closing_the_anvil() {
+        let bot = offline_bot();
+        let mut manager = EnchanterManager::new();
+        for attempt in 1..=MAX_FAILED_COMBINE_ATTEMPTS {
+            // The reopened anvil re-sends the click and the server never answers it.
+            manager.anvil_container_id = Some(7);
+            manager.pending_click = Some((0, ItemStack::Empty, stalled_since(), HashMap::new(), 3));
+            assert!(!manager.process_anvil_combines(&bot).await);
+            assert_eq!(manager.anvil_container_id, None, "each stall closes the anvil to recover inputs");
+            assert!(manager.pending_click.is_none());
+            assert_eq!(manager.failure_limit_reached(), attempt == MAX_FAILED_COMBINE_ATTEMPTS);
+        }
+        // This branch used to only log, so close -> reopen -> click repeated forever.
+        // Escalating is the worker's job, after the close has reached the server.
+        assert_eq!(disconnect_requests(&bot), 0);
+        manager.reset_for_next_batch();
+        assert!(!manager.failure_limit_reached());
+    }
+
+    #[tokio::test]
+    async fn stalled_recipe_closes_the_anvil_before_any_disconnect() {
+        use azalea_registry::builtin::ItemKind;
+        let bot = offline_bot();
+        let mut manager = EnchanterManager::new();
+        manager.failed_combine_attempts = MAX_FAILED_COMBINE_ATTEMPTS - 1;
+        manager.anvil_container_id = Some(7);
+        manager.anvil_slots.insert(0, ItemStack::new(ItemKind::DiamondHelmet, 1));
+        manager.anvil_slots.insert(1, ItemStack::new(ItemKind::EnchantedBook, 1));
+        manager.recipe_wait_since = Some(stalled_since());
+        // Both inputs are in the anvil and the repair cost never arrives.
+        assert!(!manager.process_anvil_combines(&bot).await);
+        assert!(manager.failure_limit_reached());
+        assert_eq!(manager.anvil_container_id, None);
+        // Disconnecting before the close is processed makes vanilla drop both inputs.
+        assert_eq!(disconnect_requests(&bot), 0);
+    }
+
+    #[test]
+    fn anvil_cost_uses_actual_prior_work_penalty_and_name_removal() {
+        let book = |enchantment: &str, level: u32| ItemInfo {
+            kind: "EnchantedBook".to_string(),
+            stored_enchantments: [(enchantment.to_string(), level)].into_iter().collect(),
+            ..Default::default()
+        };
+        // Helmet delivered with Mending already applied in an anvil (repair cost 1).
+        let mut helmet = ItemInfo { kind: "DiamondHelmet".to_string(), count: 1, repair_cost: Some(1), ..Default::default() };
+        helmet.enchantments.insert("mending".to_string(), 1);
+        assert_eq!(EnchanterManager::expected_clean_combine_cost(&helmet, &book("protection", 4)), 5);
+        // After Protection IV its repair cost is 3, so Unbreaking III costs 3 + 3 = 6 levels.
+        // The old model assumed 4 and rejected every clean Unbreaking III book (6 > 4 + 1).
+        helmet.enchantments.insert("protection".to_string(), 4);
+        helmet.repair_cost = Some(3);
+        assert_eq!(EnchanterManager::expected_clean_combine_cost(&helmet, &book("unbreaking", 3)), 6);
+        // Renamed armor: the anvil strips the name for one extra level.
+        let named_legs = ItemInfo { kind: "DiamondLeggings".to_string(), count: 1, has_custom_name: true, ..Default::default() };
+        assert_eq!(EnchanterManager::expected_clean_combine_cost(&named_legs, &book("blast_protection", 4)), 9);
+        // A hostile repair cost saturates instead of overflowing.
+        let boots = ItemInfo { kind: "DiamondBoots".to_string(), count: 1, repair_cost: Some(u32::MAX), ..Default::default() };
+        assert_eq!(EnchanterManager::expected_clean_combine_cost(&boots, &book("mending", 1)), u32::MAX);
+    }
+
+    #[tokio::test]
+    async fn pre_worked_armor_is_combined_with_a_clean_book_instead_of_discarding_it() {
+        use azalea_registry::builtin::ItemKind;
+        use azalea_inventory::components::{CustomName, RepairCost};
+        let bot = offline_bot();
+        // Delivered helmet that was already worked twice in an anvil (repair cost 3).
+        let helmet = ItemStack::new(ItemKind::DiamondHelmet, 1).with_component(RepairCost { cost: 3 });
+        let book = ItemStack::new(ItemKind::EnchantedBook, 1)
+            .with_component(CustomName { name: "Protection IV".into() });
+        let mut manager = EnchanterManager::new();
+        manager.anvil_container_id = Some(7);
+        manager.anvil_slots.insert(30, helmet.clone());
+        manager.anvil_slots.insert(31, book.clone());
+        let task = manager.find_next_combine_task(&bot).unwrap();
+        assert_eq!(task.required_level, 7, "3 levels of prior work + 4 for Protection IV");
+
+        // XP is thrown for the real cost before staging, not for a fresh helmet's 4 levels.
+        manager.current_level.store(4, Ordering::SeqCst);
+        assert!(!manager.process_anvil_combines(&bot).await);
+        assert_eq!(manager.xp_target, Some(7));
+
+        // Inputs staged; the server charges exactly the expected 7 levels.
+        manager.anvil_container_id = Some(7);
+        for (slot, item) in [(0, helmet.clone()), (1, book.clone()), (2, helmet), (30, ItemStack::Empty), (31, ItemStack::Empty)] {
+            manager.anvil_slots.insert(slot, item);
+        }
+        manager.active_combine_task = Some(task.clone());
+        manager.server_anvil_cost.store(7, Ordering::SeqCst);
+        manager.current_level.store(7, Ordering::SeqCst);
+        assert!(!manager.process_anvil_combines(&bot).await);
+        assert!(!manager.rejection_recovery, "a clean book must not be blamed for the armor's penalty");
+        assert!(manager.pending_rejection_book.is_none());
+        assert_eq!(manager.pending_click.as_ref().map(|click| click.0), Some(2), "collects the result");
+
+        // A book whose own penalty adds more than one level is still rejected.
+        manager.pending_click = None;
+        manager.active_combine_task = Some(task);
+        manager.server_anvil_cost.store(9, Ordering::SeqCst);
+        manager.current_level.store(9, Ordering::SeqCst);
+        assert!(!manager.process_anvil_combines(&bot).await);
+        assert!(manager.rejection_recovery);
+        assert_eq!(manager.pending_rejection_book, Some(book));
+    }
+
+    #[tokio::test]
+    async fn armor_too_worked_for_any_book_is_skipped_and_never_costs_a_book() {
+        use azalea_registry::builtin::ItemKind;
+        use azalea_inventory::components::{CustomName, RepairCost};
+        let bot = offline_bot();
+        let worn_out = ItemStack::new(ItemKind::DiamondHelmet, 1).with_component(RepairCost { cost: 63 });
+        let book = ItemStack::new(ItemKind::EnchantedBook, 1)
+            .with_component(CustomName { name: "Protection IV".into() });
+        let mut manager = EnchanterManager::new();
+        manager.anvil_slots.insert(3, worn_out.clone());
+        manager.anvil_slots.insert(31, book.clone());
+        // 63 + 4 levels is Too Expensive. No task, so no XP is thrown toward an unreachable level.
+        assert!(manager.find_next_combine_task(&bot).is_none());
+        // Another helmet can still be finished.
+        manager.anvil_slots.insert(20, ItemStack::new(ItemKind::DiamondHelmet, 1));
+        let task = manager.find_next_combine_task(&bot).unwrap();
+        assert_eq!((task.armor_slot, task.required_level), (20, 4));
+
+        // If such inputs are already in the anvil, return them and keep the book.
+        manager.anvil_container_id = Some(7);
+        manager.anvil_slots.insert(0, worn_out);
+        manager.anvil_slots.insert(1, book);
+        manager.server_anvil_cost.store(67, Ordering::SeqCst);
+        assert!(!manager.process_anvil_combines(&bot).await);
+        assert!(manager.rejection_recovery, "inputs are swapped back to the hotbar");
+        assert!(manager.pending_rejection_book.is_none(), "the book is not blamed for the armor's penalty");
     }
 }
